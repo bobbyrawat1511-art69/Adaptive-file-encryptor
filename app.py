@@ -4,89 +4,95 @@ import time
 import zipfile
 import tempfile
 import shutil
-import io # Used for the in-memory file buffer
-import uuid # Used for decryption session IDs
+import uuid
+import threading
 from flask import (
     Flask, request, send_from_directory, jsonify, 
     send_file, make_response, after_this_request
 )
-# Import flask-cors
 from flask_cors import CORS
 from pathlib import Path
 from werkzeug.utils import secure_filename
+from concurrent.futures import ProcessPoolExecutor
 
-# Import your existing, powerful Python logic
+# Import your logic
 from ai_encryptor_plus.cli_plus import run_encrypt, run_decrypt
 from ai_encryptor_plus.autotuner import tune_short
 from ai_encryptor_plus.config import DEFAULT_CHUNK_MB
+from ai_encryptor_plus.scheduler_plus import SchedulerPlus
 
-# --- Set defaults in the global scope ---
-BEST_WORKERS = os.cpu_count() or 4
-BEST_CHUNK_SIZE = DEFAULT_CHUNK_MB * 1024 * 1024
-
-# --- A cache to hold paths to decrypted files ---
-DECRYPTED_SESSIONS = {}
-
-# Create the Flask web application
 app = Flask(__name__, static_folder='ai_encryptor_plus/ui')
-
-# --- Initialize CORS on your app ---
 CORS(app)
 
+# --- GLOBAL SYSTEM STATE (Lazy Loaded) ---
+# We initialize these as None. They are spun up only on the first request.
+GLOBAL_POOL = None
+GLOBAL_SCHEDULER = None
+_SYSTEM_LOCK = threading.Lock() # Lock to prevent race condition during tuning
 
-# --- Page Routes ---
+# Defaults (will be updated by tuner)
+BEST_WORKERS = 4
+BEST_CHUNK_SIZE = DEFAULT_CHUNK_MB * 1024 * 1024
+
+# Cache
+DECRYPTED_SESSIONS = {}
+
+# --- HELPER: LAZY INITIALIZATION ---
+def ensure_system_ready():
+    """
+    Runs the auto-tuner and starts the process pool ONLY when needed.
+    Uses a Lock to prevent concurrent tuning (solving the double-run issue).
+    """
+    global GLOBAL_POOL, GLOBAL_SCHEDULER, BEST_WORKERS, BEST_CHUNK_SIZE
+    
+    # 1. Fast Check (If initialized, exit quickly)
+    if GLOBAL_POOL is not None:
+        return
+
+    # 2. Lock Critical Section (Only one thread can pass here)
+    with _SYSTEM_LOCK:
+        # 3. Double Check (Safety) - In case another thread finished while we waited
+        if GLOBAL_POOL is not None:
+            return
+
+        print("--- 🐢 Lazy Loading: Waking up AI & Auto-Tuner... ---")
+        try:
+            # Run the benchmark now (first time)
+            res = tune_short()
+            BEST_WORKERS = res.get('best_workers', os.cpu_count() or 4)
+            BEST_CHUNK_SIZE = res.get('best_chunk', DEFAULT_CHUNK_MB * 1024 * 1024)
+            print(f"--- System Optimized: {BEST_WORKERS} Workers | {BEST_CHUNK_SIZE//1024//1024}MB Chunks ---")
+        except Exception as e:
+            print(f"--- Tuner skipped ({e}), using defaults ---")
+
+        # Initialize the persistent OS resources
+        GLOBAL_POOL = ProcessPoolExecutor(max_workers=BEST_WORKERS)
+        GLOBAL_SCHEDULER = SchedulerPlus(max_workers=BEST_WORKERS)
+
+# --- ROUTES ---
 
 @app.route('/')
 def serve_index():
-    """Serves your index.html file"""
     return send_from_directory(app.static_folder, 'index.html')
 
 @app.route('/<path:filename>')
 def serve_static(filename):
-    """Serves any other files in your /ui folder (like CSS or JS)"""
     return send_from_directory(app.static_folder, filename)
 
 @app.route('/api/settings')
 def get_settings():
-    """Provides the auto-detected settings to the UI."""
+    # User clicked a button or uploaded a file -> Initialize the system!
+    ensure_system_ready()
+    
     return jsonify({
         "workers": BEST_WORKERS,
         "chunk_mb": BEST_CHUNK_SIZE // 1024 // 1024
     })
 
-# --- Helper to read file and clean up ---
-
-def _read_and_cleanup(file_path: Path, temp_dir: Path) -> io.BytesIO:
-    """
-    Helper to read a file into memory and immediately delete the temp folder.
-    This fixes the Windows [WinError 32] file locking issue.
-    """
-    try:
-        # Read the file into a memory buffer
-        memory_buffer = io.BytesIO()
-        with open(file_path, 'rb') as f:
-            memory_buffer.write(f.read())
-        memory_buffer.seek(0) # Rewind the buffer to the beginning
-        
-        print(f"--- File '{file_path.name}' read into memory. ---")
-        return memory_buffer
-    finally:
-        # Now that the file is in memory, we can safely delete the temp dir
-        print(f"--- Cleaning up temp directory: {temp_dir} ---")
-        try:
-            if temp_dir and temp_dir.exists():
-                shutil.rmtree(temp_dir)
-        except Exception as e:
-            print(f"Error cleaning up temp dir: {e}")
-
-# --- API Routes ---
-
 @app.route('/api/encrypt', methods=['POST'])
 def handle_encrypt():
-    """
-    This endpoint runs a SINGLE encryption job
-    based on the selected policy.
-    """
+    ensure_system_ready() # Ensure pool exists before processing
+    
     temp_dir = Path(tempfile.mkdtemp())
     try:
         files = request.files.getlist('files')
@@ -95,7 +101,9 @@ def handle_encrypt():
         policy = request.form.get('policy', 'priority') 
         
         if not files or not password:
-            return jsonify({"error": "Missing files or password"}), 400
+            return jsonify({"error": "Missing files/password"}), 400
+
+        threshold_chunk = int(BEST_CHUNK_SIZE )
 
         in_dir = temp_dir / "in"
         out_dir = temp_dir / "out"
@@ -105,208 +113,144 @@ def handle_encrypt():
         for f in files:
             f.save(in_dir / secure_filename(f.filename))
             
-        os.environ['AI_ENC_MASTER'] = password
+        print(f"--- Processing ({policy}) ---")
         
-        print(f"--- Starting Single Run: Policy={policy} ---")
-        
-        time_elapsed, zip_path = run_encrypt(
+        time_elapsed, zip_path_str = run_encrypt(
             in_dir=str(in_dir), out_dir=str(out_dir),
-            mode=mode, 
-            workers=BEST_WORKERS, 
-            # 'resume' is removed and hardcoded to False inside run_encrypt
-            policy=policy, 
-            use_processes=True, 
-            chunk_size=BEST_CHUNK_SIZE
+            mode=mode, master_secret=password,
+            workers=BEST_WORKERS, policy=policy, 
+            use_processes=True, chunk_size=threshold_chunk,
+            scheduler=GLOBAL_SCHEDULER, executor=GLOBAL_POOL
         )
-        print(f"--- {policy} run complete in {time_elapsed:.4f}s ---")
         
-        # Read file into memory and delete temp dir
-        zip_buffer = _read_and_cleanup(Path(zip_path), temp_dir)
+        zip_path = Path(zip_path_str)
 
-        response = make_response(send_file(
-            zip_buffer, 
-            as_attachment=True, 
-            download_name=Path(zip_path).name
-        ))
+        @after_this_request
+        def cleanup(response):
+            try: shutil.rmtree(temp_dir, ignore_errors=True)
+            except: pass
+            return response
+
+        response = make_response(send_file(zip_path, as_attachment=True, download_name=zip_path.name))
         response.headers['X-Time-Elapsed'] = f"{time_elapsed:.4f}"
-        
         return response
 
     except Exception as e:
-        print(f"Encrypt failed: {e}")
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
+        print(f"Error: {e}")
+        if temp_dir.exists(): shutil.rmtree(temp_dir, ignore_errors=True)
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/compare', methods=['POST'])
 def handle_compare():
-    """
-    This endpoint runs BOTH policies back-to-back for comparison.
-    """
+    ensure_system_ready()
+    
     temp_dir = Path(tempfile.mkdtemp())
     try:
         files = request.files.getlist('files')
         password = request.form.get('password')
         mode = request.form.get('mode', 'gcm')
         
-        if not files or not password:
-            return jsonify({"error": "Missing files or password"}), 400
-
         in_dir = temp_dir / "in"
         in_dir.mkdir(parents=True, exist_ok=True)
-        for f in files:
-            f.save(in_dir / secure_filename(f.filename))
+        for f in files: f.save(in_dir / secure_filename(f.filename))
             
-        os.environ['AI_ENC_MASTER'] = password
-        
-        print(f"--- Starting Comparison: Running FIFO ---")
-        out_dir_fifo = temp_dir / "out_fifo"
-        time_fifo, zip_fifo_path = run_encrypt(
-            in_dir=str(in_dir), out_dir=str(out_dir_fifo),
-            mode=mode, workers=BEST_WORKERS, 
-            policy='fifo', use_processes=True,
-            chunk_size=BEST_CHUNK_SIZE
-        )
-        print(f"--- FIFO complete in {time_fifo:.4f}s ---")
+        threshold_chunk = int(BEST_CHUNK_SIZE)
 
-        print(f"--- Starting Comparison: Running AI-Priority ---")
-        out_dir_ai = temp_dir / "out_ai"
-        time_ai, zip_ai_path = run_encrypt(
-            in_dir=str(in_dir), out_dir=str(out_dir_ai),
-            mode=mode, workers=BEST_WORKERS, 
-            policy='priority', use_processes=True,
-            chunk_size=BEST_CHUNK_SIZE
+        print("--- Compare: FIFO ---")
+        out_fifo = temp_dir / "out_fifo"
+        t_fifo, _ = run_encrypt(
+            str(in_dir), str(out_fifo), mode, password, BEST_WORKERS, 
+            policy='fifo', use_processes=True, chunk_size=threshold_chunk,
+            executor=GLOBAL_POOL
         )
-        print(f"--- AI-Priority complete in {time_ai:.4f}s ---")
 
-        # Read the AI zip into memory and delete the *entire* temp dir
-        zip_buffer = _read_and_cleanup(Path(zip_ai_path), temp_dir)
+        print("--- Compare: AI ---")
+        out_ai = temp_dir / "out_ai"
+        t_ai, z_ai = run_encrypt(
+            str(in_dir), str(out_ai), mode, password, BEST_WORKERS, 
+            policy='priority', use_processes=True, chunk_size=threshold_chunk,
+            scheduler=GLOBAL_SCHEDULER, executor=GLOBAL_POOL
+        )
         
-        response = make_response(send_file(
-            zip_buffer, 
-            as_attachment=True, 
-            download_name=Path(zip_ai_path).name
-        ))
-        response.headers['X-Time-FIFO'] = f"{time_fifo:.4f}"
-        response.headers['X-Time-AI'] = f"{time_ai:.4f}"
-        
+        @after_this_request
+        def cleanup(response):
+            try: shutil.rmtree(temp_dir, ignore_errors=True)
+            except: pass
+            return response
+            
+        response = make_response(send_file(Path(z_ai), as_attachment=True, download_name=Path(z_ai).name))
+        response.headers['X-Time-FIFO'] = f"{t_fifo:.4f}"
+        response.headers['X-Time-AI'] = f"{t_ai:.4f}"
         return response
 
     except Exception as e:
-        print(f"Compare failed: {e}")
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir) 
+        if temp_dir.exists(): shutil.rmtree(temp_dir, ignore_errors=True)
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/api/decrypt', methods=['POST'])
 def handle_decrypt():
-    """
-    Decrypts files and returns a JSON list with a session ID.
-    """
+    ensure_system_ready()
+    
     temp_dir = Path(tempfile.mkdtemp())
     try:
         file = request.files.get('file')
         password = request.form.get('password')
 
-        if not file or not password:
-            return jsonify({"error": "Missing file or password"}), 400
-
         in_dir = temp_dir / "in"
-        out_dir = temp_dir / "out" # This is where decrypted files will go
-        zip_path = temp_dir / secure_filename(file.filename)
-        
+        out_dir = temp_dir / "out"
         in_dir.mkdir(parents=True, exist_ok=True)
         out_dir.mkdir(parents=True, exist_ok=True)
         
+        zip_path = temp_dir / secure_filename(file.filename)
         file.save(zip_path)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(in_dir)
 
-        os.environ['AI_ENC_MASTER'] = password
-        print(f"--- Starting backend decryption ---")
+        # Secure Extract
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            for m in z.infolist():
+                if m.is_dir(): continue
+                target = (in_dir / m.filename).resolve()
+                if str(target).startswith(str(in_dir.resolve())):
+                    z.extract(m, in_dir)
 
         run_decrypt(
-            in_dir=str(in_dir), out_dir=str(out_dir),
-            workers=BEST_WORKERS,
-            use_processes=True
+            str(in_dir), str(out_dir), password, BEST_WORKERS,
+            use_processes=True, executor=GLOBAL_POOL
         )
 
-        # 1. Scan the output directory for decrypted files
-        decrypted_files = []
-        for root, dirs, files in os.walk(out_dir):
-            for f in files:
-                relative_path = Path(root).relative_to(out_dir) / f
-                decrypted_files.append(str(relative_path.as_posix()))
-
-        # 2. Create a session ID and store the path
-        session_id = str(uuid.uuid4())
-        DECRYPTED_SESSIONS[session_id] = {
-            "path": out_dir,
-            "time": time.time()
-        }
+        files = [str(Path(r).relative_to(out_dir)/f) for r,d,fs in os.walk(out_dir) for f in fs]
+        sid = str(uuid.uuid4())
+        DECRYPTED_SESSIONS[sid] = { "path": out_dir, "time": time.time() }
         
-        print(f"--- Decryption complete. Found {len(decrypted_files)} files. Session: {session_id} ---")
-
-        # 3. Return the JSON list of files
-        return jsonify({
-            "session_id": session_id,
-            "files": decrypted_files
-        })
+        return jsonify({ "session_id": sid, "files": files })
 
     except Exception as e:
-        print(f"Decryption failed: {e}")
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
+        if temp_dir.exists(): shutil.rmtree(temp_dir, ignore_errors=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/download_decrypted/<session_id>/<path:filename>')
 def download_decrypted_file(session_id, filename):
-    """
-    This endpoint sends an individual decrypted file.
-    """
-    session = DECRYPTED_SESSIONS.get(session_id)
-    if not session:
-        return "Session not found or expired", 404
-        
-    base_path = Path(session["path"])
-    safe_filename = Path(filename.replace("..", "")) # Basic sanitization
-    file_path = (base_path / safe_filename).resolve()
-
-    if not str(file_path).startswith(str(base_path.resolve())):
-        print(f"--- FORBIDDEN: User tried to access file outside of session path ---")
-        return "Forbidden", 403
-
-    if not file_path.is_file():
-        return "File not found", 404
-        
-    print(f"--- Sending file: {file_path} ---")
-    
-    return send_file(
-        file_path, 
-        as_attachment=True, 
-        download_name=safe_filename.name
-    )
-
-
-def run_tuner():
-    """Runs tuner and updates global variables."""
-    global BEST_WORKERS, BEST_CHUNK_SIZE
-    print("--- Running initial auto-tuner (this may take a few seconds)... ---")
-    try:
-        tuning_results = tune_short()
-        BEST_WORKERS = tuning_results.get('best_workers', os.cpu_count() or 4)
-        BEST_CHUNK_SIZE = tuning_results.get('best_chunk', DEFAULT_CHUNK_MB * 1024 * 1024)
-        print(f"--- Auto-tuner complete: Using {BEST_WORKERS} workers and {BEST_CHUNK_SIZE // 1024 // 1024}MB chunks ---")
-    except Exception as e:
-        print(f"--- Auto-tuner failed ({e}), falling back to defaults ---")
-        pass
+    sess = DECRYPTED_SESSIONS.get(session_id)
+    if not sess: return "Expired", 404
+    safe_p = (Path(sess["path"]) / filename.replace("..", "")).resolve()
+    if not safe_p.is_file(): return "Not found", 404
+    return send_file(safe_p, as_attachment=True, download_name=safe_p.name)
 
 if __name__ == '__main__':
-    # Run tuner only when the *main* process starts
-    run_tuner() 
-    # Add exclude_patterns to stop reloads on temp/db file changes
-    app.run(debug=True, port=5000, exclude_patterns=[
-        "*.tmp", "*.db", "*.json", "*.json.tmp", "*.pkl", "*.db-journal"
-    ])
+    # We add exclude_patterns to stop the server from restarting 
+    # when we write to keyvault.db or output folders, solving the previous stability issues.
+    app.run(
+        debug=True, 
+        port=5000, 
+        exclude_patterns=[
+            "keyvault.db", 
+            "*.db", 
+            "*.db-journal", 
+            "*.enc", 
+            "*.json", 
+            "*.tmp",
+            "__pycache__",
+            "*/site-packages/*",
+            "*/Lib/*"
+        ]
+    )
