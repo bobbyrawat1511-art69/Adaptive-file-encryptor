@@ -1,367 +1,349 @@
 /* ========= Global Helpers ========= */
-// ID se element select karne ke liye helper
+// helper to get element by id quickly
 const $ = id => document.getElementById(id);
-let comparisonChart; // Global chart instance
-let chosenFilesEnc = []; // Encryption ke liye select kiye hue files
-let chosenFilesCmp = []; // Comparison ke liye select kiye hue files
+// variable for the comparison Chart.js instance (will be set later)
+let comparisonChart; 
+// arrays to hold selected files for encrypt and compare flows
+let chosenFilesEnc = []; 
+let chosenFilesCmp = []; 
+// flag to ensure settings are fetched only once after first upload
+let settingsLoaded = false; // Flag to prevent spamming server
 
-// Bytes ko readable format mein convert karo (B, KB, MB, GB)
+// format bytes into human readable string
 function fmtBytes(n) {
-    if (n < 1) return "0 B";
-    if (n < 1024) return n.toFixed(0) + " B";
-    if (n < 1024 ** 2) return (n / 1024).toFixed(1) + " KB";
-    if (n < 1024 ** 3) return (n / 1024 ** 2).toFixed(1) + " MB";
-    return (n / 1024 ** 3).toFixed(1) + " GB";
+    if (n < 1) return "0 B"; // zero or negative -> 0 B
+    if (n < 1024) return n.toFixed(0) + " B"; // bytes
+    if (n < 1024 ** 2) return (n / 1024).toFixed(1) + " KB"; // kilobytes
+    if (n < 1024 ** 3) return (n / 1024 ** 2).toFixed(1) + " MB"; // megabytes
+    return (n / 1024 ** 3).toFixed(1) + " GB"; // gigabytes and above
 }
 
-// Blob ko download karo
-function downloadBlob(blob, filename) {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 800);
-}
-
-// Log message ko text ke taur par add karo
+// append a plain text log line to the given tab's log element
 function log(tab, m) {
-    const logEl = $(`log-${tab}`);
-    logEl.textContent += m + "\n";
-    logEl.scrollTop = logEl.scrollHeight;
+    const logEl = $(`log-${tab}`); // get the log element for the tab
+    logEl.textContent += m + "\n"; // append message + newline
+    logEl.scrollTop = logEl.scrollHeight; // scroll to bottom
 }
 
-// Log mein HTML element (jaise links) add karo
+// append an HTML element to the given tab's log element
 function logHTML(tab, html) {
-    const logEl = $(`log-${tab}`);
-    logEl.appendChild(html);
-    logEl.scrollTop = logEl.scrollHeight;
+    const logEl = $(`log-${tab}`); // get the log element for the tab
+    logEl.appendChild(html); // append the provided node
+    logEl.scrollTop = logEl.scrollHeight; // scroll to bottom
 }
 
-// Status message footer mein dikhaao
+// set the footer status text
 function setStatus(text) {
-    $('footer').textContent = `Status: ${text}`;
+    $('footer').textContent = `Status: ${text}`; // update footer
 }
 
-/* ========= Auto-Settings Fetcher ========= */
-// Server se auto settings fetch karo aur UI mein update karo
-async function fetchAutoSettings() {
+/* ========= UI REVEAL LOGIC (The "On Upload" Trigger) ========= */
+// fetch tuned settings from the server and reveal them in the UI
+async function revealSettings() {
+    // If we already tuned the system, don't do it again.
+    if (settingsLoaded) return; // no-op if already loaded
+
+    setStatus("Analyzing hardware & workload..."); // indicate work
     try {
-        const response = await fetch('/api/settings');
-        if (!response.ok) throw new Error('Failed to fetch settings');
-        const settings = await response.json();
+        const response = await fetch('/api/settings'); // call backend
+        if (!response.ok) throw new Error('Failed'); // throw on bad status
+        const settings = await response.json(); // parse JSON
         
-        // Encrypt tab ko update karo
-        $('auto-workers-enc').textContent = settings.workers;
-        $('auto-chunk-enc').textContent = settings.chunk_mb;
+        const w = settings.workers; // recommended workers
+        const c = settings.chunk_mb; // recommended chunk size
+
+        // Update DOM with recommended values for both encrypt and compare UIs
+        $('auto-workers-enc').textContent = w;
+        $('auto-chunk-enc').textContent = c;
+        $('auto-workers-cmp').textContent = w;
+        $('auto-chunk-cmp').textContent = c;
         
-        // Compare tab ko update karo
-        $('auto-workers-cmp').textContent = settings.workers;
-        $('auto-chunk-cmp').textContent = settings.chunk_mb;
-        
+        settingsLoaded = true; // mark as done
+        setStatus("System optimized. Ready."); // update status
     } catch (e) {
-        console.error("Failed to load auto-settings", e);
-        // Default values set karo agar fetch fail ho
-        $('auto-workers-enc').textContent = '4 (Default)';
-        $('auto-chunk-enc').textContent = '8 (Default)';
-        $('auto-workers-cmp').textContent = '4 (Default)';
-        $('auto-chunk-cmp').textContent = '8 (Default)';
+        console.error("Settings fetch error", e); // log error to console
+        setStatus("Ready (Default Settings)"); // fallback status
     }
 }
 
-/* ========= Tab/Page Switching ========= */
-// Sab tabs, pages aur settings panels collect karo
+/* ========= Tab Switching ========= */
+// cache tab buttons and page containers
 const tabs = [$('btnTabEncrypt'), $('btnTabDecrypt'), $('btnTabCompare')];
 const pages = [$('encrypt-page'), $('decrypt-page'), $('compare-page')];
 const settingsPanels = [$('settings-encrypt'), $('settings-decrypt'), $('settings-compare')];
 
-// Tab switch karo - pehle sab ko hide karo, phir selected ko show karo
+// switch visible tab/page and show corresponding settings panel
 function switchTab(tabId) {
-    tabs.forEach(t => t.classList.remove('active'));
-    pages.forEach(p => p.classList.remove('active'));
-    settingsPanels.forEach(s => s.classList.add('hidden'));
+    tabs.forEach(t => t.classList.remove('active')); // deactivate all tab buttons
+    pages.forEach(p => p.classList.remove('active')); // hide all pages
+    settingsPanels.forEach(s => s.classList.add('hidden')); // hide all settings panels
 
-    if (tabId === 'encrypt') {
-        $('btnTabEncrypt').classList.add('active');
-        $('encrypt-page').classList.add('active');
-        $('settings-encrypt').classList.remove('hidden');
-    } else if (tabId === 'decrypt') {
-        $('btnTabDecrypt').classList.add('active');
-        $('decrypt-page').classList.add('active');
-        $('settings-decrypt').classList.remove('hidden');
-    } else {
-        $('btnTabCompare').classList.add('active');
-        $('compare-page').classList.add('active');
-        $('settings-compare').classList.remove('hidden');
+    if (tabId === 'encrypt') { // encrypt tab selected
+        $('btnTabEncrypt').classList.add('active'); // highlight encrypt tab
+        $('encrypt-page').classList.add('active'); // show encrypt page
+        $('settings-encrypt').classList.remove('hidden'); // show encrypt settings
+    } else if (tabId === 'decrypt') { // decrypt tab selected
+        $('btnTabDecrypt').classList.add('active'); // highlight decrypt tab
+        $('decrypt-page').classList.add('active'); // show decrypt page
+        $('settings-decrypt').classList.remove('hidden'); // show decrypt settings
+    } else { // compare tab selected
+        $('btnTabCompare').classList.add('active'); // highlight compare tab
+        $('compare-page').classList.add('active'); // show compare page
+        $('settings-compare').classList.remove('hidden'); // show compare settings
     }
 }
-// Tab buttons ke liye click handlers
-$('btnTabEncrypt').onclick = () => switchTab('encrypt');
-$('btnTabDecrypt').onclick = () => switchTab('decrypt');
-$('btnTabCompare').onclick = () => switchTab('compare');
+$('btnTabEncrypt').onclick = () => switchTab('encrypt'); // wire encrypt tab click
+$('btnTabDecrypt').onclick = () => switchTab('decrypt'); // wire decrypt tab click
+$('btnTabCompare').onclick = () => switchTab('compare'); // wire compare tab click
 
-
-/* ========= File List Renderer ========= */
-// File list ko UI mein render karo aur summary dikhao
+/* ========= File Lists (Trigger Logic Here) ========= */
+// render a list of files in the given container and show a summary
 function renderFileList(fileArray, listElId, summaryElId, enableFn) {
-    const listEl = $(listElId);
-    const summaryEl = $(summaryElId);
-    enableFn();
-    let totalSize = 0;
-    if (!fileArray.length) {
-        listEl.innerHTML = "";
-        summaryEl.classList.add('hidden');
-        return;
+    const listEl = $(listElId); // container for file items
+    const summaryEl = $(summaryElId); // summary element
+    
+    // 1. TRIGGER OPTIMIZATION ON UPLOAD
+    if (fileArray.length > 0) {
+        revealSettings(); // trigger settings fetch on first upload
     }
-    summaryEl.classList.remove('hidden');
+
+    enableFn(); // call provided enable/disable function for action buttons
+    let totalSize = 0; // accumulator for total size
+    if (!fileArray.length) {
+        listEl.innerHTML = ""; // clear list if no files
+        summaryEl.classList.add('hidden'); // hide summary
+        return; // nothing more to do
+    }
+    summaryEl.classList.remove('hidden'); // show summary area
     listEl.innerHTML = fileArray.map(f => {
-        totalSize += f.size;
+        totalSize += f.size; // add to total
+        // create an HTML fragment per file (name + formatted size)
         return `<div class="file-item"><div class="file-details"><h4>${f.name}</h4><p>${fmtBytes(f.size)}</p></div></div>`;
-    }).join('');
-    summaryEl.textContent = `${fileArray.length} file(s) — Total size: ${fmtBytes(totalSize)}`;
+    }).join(''); // join fragments into a single string
+    summaryEl.textContent = `${fileArray.length} file(s) — Total size: ${fmtBytes(totalSize)}`; // set summary text
 }
 
-/* ========= Encrypt Page Logic ========= */
-// Encrypt button ko enable/disable karo based on files aur password
+/* ========= Encrypt Page ========= */
+// enable/disable encrypt button based on chosen files and password presence
 const enableEncrypt = () => { $('btnEncrypt').disabled = !(chosenFilesEnc.length && $('pwEnc').value.trim()); };
-$('pwEnc').oninput = enableEncrypt;
+$('pwEnc').oninput = enableEncrypt; // re-evaluate when password input changes
 
-// Encrypt file drop zone setup
-const dzEnc = $('drop-enc');
-dzEnc.onclick = () => $('files-enc').click();
-dzEnc.ondragover = (e) => { e.preventDefault(); dzEnc.classList.add('drag-over'); };
-dzEnc.ondragleave = () => dzEnc.classList.remove('drag-over');
+const dzEnc = $('drop-enc'); // dropzone element for encrypt page
+dzEnc.onclick = () => $('files-enc').click(); // clicking dropzone opens file selector
+dzEnc.ondragover = (e) => { e.preventDefault(); dzEnc.classList.add('drag-over'); }; // styling on dragover
+dzEnc.ondragleave = () => dzEnc.classList.remove('drag-over'); // remove styling on drag leave
+
+// Drop Event
 dzEnc.ondrop = (e) => {
-    e.preventDefault();
-    dzEnc.classList.remove('drag-over');
-    chosenFilesEnc = Array.from(e.dataTransfer.files || []);
-    renderFileList(chosenFilesEnc, 'fileList-enc', 'summary-enc', enableEncrypt);
+    e.preventDefault(); // prevent default browser behavior
+    dzEnc.classList.remove('drag-over'); // remove drag styling
+    chosenFilesEnc = Array.from(e.dataTransfer.files || []); // capture dropped files
+    renderFileList(chosenFilesEnc, 'fileList-enc', 'summary-enc', enableEncrypt); // render UI
 };
-// File input change handler
+// File Select Event
 $('files-enc').onchange = (e) => {
-    chosenFilesEnc = Array.from(e.target.files || []);
-    renderFileList(chosenFilesEnc, 'fileList-enc', 'summary-enc', enableEncrypt);
+    chosenFilesEnc = Array.from(e.target.files || []); // capture selected files
+    renderFileList(chosenFilesEnc, 'fileList-enc', 'summary-enc', enableEncrypt); // render UI
 };
 
-// Encrypt button click - files ko server pe bhejo aur download link dalo
 $('btnEncrypt').onclick = async () => {
-    $('btnEncrypt').disabled = true;
-    log('enc', "🚀 Starting encryption... Uploading files to server.");
-    setStatus("Encrypting...");
+    $('btnEncrypt').disabled = true; // prevent double clicks
+    
+    // Note: No revealSettings() here anymore. It's already done!
+    log('enc', "🚀 Starting encryption... Uploading files."); // log start message
+    setStatus("Encrypting..."); // update status
 
-    const formData = new FormData();
-    formData.append('password', $('pwEnc').value.trim());
-    formData.append('mode', $('aesModeEnc').value);
-    formData.append('policy', $('policyEnc').value);
-    chosenFilesEnc.forEach(f => formData.append('files', f, f.name));
+    const formData = new FormData(); // create form payload
+    formData.append('password', $('pwEnc').value.trim()); // add password
+    formData.append('mode', $('aesModeEnc').value); // add AES mode
+    formData.append('policy', $('policyEnc').value); // add policy
+    chosenFilesEnc.forEach(f => formData.append('files', f, f.name)); // append each file
 
     try {
-        const response = await fetch('/api/encrypt', { method: 'POST', body: formData });
+        const response = await fetch('/api/encrypt', { method: 'POST', body: formData }); // send to server
         if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error || `Server responded with ${response.status}`);
+            const err = await response.json(); // parse error body
+            throw new Error(err.error || `Error ${response.status}`); // throw readable error
         }
+        const time = parseFloat(response.headers.get('X-Time-Elapsed') || '0'); // read timing header
+        log('enc', `✅ Run complete in ${time.toFixed(4)}s.`); // log server time
         
-        // Server se time elapsed aur encrypted file le aao
-        const time = parseFloat(response.headers.get('X-Time-Elapsed') || '0');
-        log('enc', `✅ Success! Run complete in ${time.toFixed(4)}s.`);
+        const blob = await response.blob(); // get binary package
+        const filename = response.headers.get('content-disposition')?.split('filename=')[1]?.replace(/"/g, '') || "encrypted.zip"; // derive filename
         
-        const blob = await response.blob();
-        const filename = response.headers.get('content-disposition')?.split('filename=')[1]?.replace(/"/g, '') || "encrypted.zip";
-        
-        log('enc', `Package created: ${filename}`);
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = filename;
-        link.textContent = `⬇️ Download "${filename}"`;
-        link.className = 'download-link';
-        logHTML('enc', link); // Download link log mein add karo
-        
-        setStatus("Encryption complete.");
+        log('enc', `Package created: ${filename}`); // log filename
+        const link = document.createElement('a'); // create download link element
+        link.href = URL.createObjectURL(blob); // create blob URL
+        link.download = filename; // set suggested filename
+        link.textContent = `⬇️ Download "${filename}"`; // link text
+        link.className = 'download-link'; // class for styling
+        logHTML('enc', link); // append link to the log area
+        setStatus("Complete."); // update status
 
     } catch (e) {
-        log('enc', `❌ ERROR: ${e.message}`);
-        setStatus(`Error: ${e.message}`);
+        log('enc', `❌ ERROR: ${e.message}`); // log error message
+        setStatus(`Error: ${e.message}`); // update status with error
     } finally {
-        $('btnEncrypt').disabled = false;
+        $('btnEncrypt').disabled = false; // re-enable button
     }
 };
 
-/* ========= Compare Page Logic ========= */
-// Compare button ko enable/disable karo
+/* ========= Compare Page ========= */
+// enable/disable compare button based on chosen files and password
 const enableCompare = () => { $('btnCompare').disabled = !(chosenFilesCmp.length && $('pwCmp').value.trim()); };
-$('pwCmp').oninput = enableCompare;
+$('pwCmp').oninput = enableCompare; // re-evaluate when password changes
 
-// Compare file drop zone setup
-const dzCmp = $('drop-cmp');
-dzCmp.onclick = () => $('files-cmp').click();
-dzCmp.ondragover = (e) => { e.preventDefault(); dzCmp.classList.add('drag-over'); };
-dzCmp.ondragleave = () => dzCmp.classList.remove('drag-over');
+const dzCmp = $('drop-cmp'); // compare dropzone
+dzCmp.onclick = () => $('files-cmp').click(); // open file selector on click
+dzCmp.ondragover = (e) => { e.preventDefault(); dzCmp.classList.add('drag-over'); }; // styling on dragover
+dzCmp.ondragleave = () => dzCmp.classList.remove('drag-over'); // remove styling on drag leave
+
 dzCmp.ondrop = (e) => {
-    e.preventDefault();
-    dzCmp.classList.remove('drag-over');
-    chosenFilesCmp = Array.from(e.dataTransfer.files || []);
-    renderFileList(chosenFilesCmp, 'fileList-cmp', 'summary-cmp', enableCompare);
+    e.preventDefault(); // prevent default
+    dzCmp.classList.remove('drag-over'); // remove drag class
+    chosenFilesCmp = Array.from(e.dataTransfer.files || []); // capture files
+    renderFileList(chosenFilesCmp, 'fileList-cmp', 'summary-cmp', enableCompare); // render
 };
 $('files-cmp').onchange = (e) => {
-    chosenFilesCmp = Array.from(e.target.files || []);
-    renderFileList(chosenFilesCmp, 'fileList-cmp', 'summary-cmp', enableCompare);
+    chosenFilesCmp = Array.from(e.target.files || []); // capture selected files
+    renderFileList(chosenFilesCmp, 'fileList-cmp', 'summary-cmp', enableCompare); // render
 };
 
-// Chart initialize karo - FIFO vs AI comparison ke liye
+// initialize Chart.js chart for comparison
 function initChart() {
-    const chartCtx = $("chart").getContext('2d');
-    comparisonChart = new Chart(chartCtx, {
+    const ctx = $("chart").getContext('2d'); // get 2D context from canvas
+    comparisonChart = new Chart(ctx, { // instantiate Chart.js
         type: 'bar',
         data: {
-            labels: ['FIFO (Naive)', 'AI-Priority'],
+            labels: ['FIFO (Naive)', 'AI-Priority'], // two bars
             datasets: [{
-                label: 'Time (seconds)',
-                data: [0, 0],
-                backgroundColor: ['rgba(239, 68, 68, 0.6)', 'rgba(59, 130, 246, 0.6)'],
-                borderColor: ['rgba(239, 68, 68, 1)', 'rgba(59, 130, 246, 1)'],
-                borderWidth: 1
+                label: 'Time (seconds)', // dataset label
+                data: [0, 0], // initial data
+                backgroundColor: ['rgba(239, 68, 68, 0.6)', 'rgba(59, 130, 246, 0.6)'], // colors
+                borderColor: ['rgba(239, 68, 68, 1)', 'rgba(59, 130, 246, 1)'], // border colors
+                borderWidth: 1 // border width
             }]
         },
         options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: { y: { beginAtZero: true, title: { display: true, text: 'Time (seconds)' } } },
-            plugins: { legend: { display: false } }
+            responsive: true, // responsive chart
+            maintainAspectRatio: false, // allow resizing freely
+            scales: { y: { beginAtZero: true, title: { display: true, text: 'Time (seconds)' } } }, // y-axis options
+            plugins: { legend: { display: false } } // hide legend
         }
     });
 }
-
-// Chart data update karo new times ke saath
+// update chart with new timing values
 function updateChart(fifoTime, priorityTime) {
-    if (!comparisonChart) initChart();
-    comparisonChart.data.datasets[0].data = [fifoTime, priorityTime];
-    comparisonChart.update();
+    if (!comparisonChart) initChart(); // init chart if needed
+    comparisonChart.data.datasets[0].data = [fifoTime, priorityTime]; // set new data
+    comparisonChart.update(); // redraw chart
 }
 
-// Compare button click - dono methods ko server pe run karo aur results dikhao
 $('btnCompare').onclick = async () => {
-    $('btnCompare').disabled = true;
-    log('cmp', "🚀 Starting comparison... Uploading files to server.");
-    setStatus("Running comparison...");
-    updateChart(0, 0);
+    $('btnCompare').disabled = true; // prevent re-click
+    
+    // Note: No revealSettings() here anymore.
+    log('cmp', "🚀 Starting comparison..."); // log start
+    setStatus("Running comparison..."); // update status
+    updateChart(0, 0); // reset chart to zeros
 
-    const formData = new FormData();
-    formData.append('password', $('pwCmp').value.trim());
-    formData.append('mode', $('aesModeCmp').value);
-    chosenFilesCmp.forEach(f => formData.append('files', f, f.name));
+    const formData = new FormData(); // create payload
+    formData.append('password', $('pwCmp').value.trim()); // add password
+    formData.append('mode', $('aesModeCmp').value); // add AES mode
+    chosenFilesCmp.forEach(f => formData.append('files', f, f.name)); // attach files
 
     try {
-        const response = await fetch('/api/compare', { method: 'POST', body: formData });
+        const response = await fetch('/api/compare', { method: 'POST', body: formData }); // send request
         if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error || `Server responded with ${response.status}`);
+            const err = await response.json(); // parse error body
+            throw new Error(err.error || `Error ${response.status}`); // throw
         }
-        log('cmp', "✅ Comparison complete on server.");
+        log('cmp', "✅ Comparison complete."); // log completion
         
-        // Server se FIFO aur AI times le aao
-        const timeFIFO = parseFloat(response.headers.get('X-Time-FIFO') || '0');
-        const timeAI = parseFloat(response.headers.get('X-Time-AI') || '0');
+        const timeFIFO = parseFloat(response.headers.get('X-Time-FIFO') || '0'); // read FIFO time header
+        const timeAI = parseFloat(response.headers.get('X-Time-AI') || '0'); // read AI time header
         
-        log('cmp', `--- RESULTS ---`);
-        log('cmp', `FIFO (Naive):   ${timeFIFO.toFixed(4)} seconds`);
-        log('cmp', `AI (Priority):  ${timeAI.toFixed(4)} seconds`);
-        updateChart(timeFIFO, timeAI);
+        log('cmp', `--- RESULTS ---`); // log separator
+        log('cmp', `FIFO (Naive):   ${timeFIFO.toFixed(4)} seconds`); // log FIFO time
+        log('cmp', `AI (Priority):  ${timeAI.toFixed(4)} seconds`); // log AI time
+        updateChart(timeFIFO, timeAI); // update chart with real values
         
-        // Kitna time save hua calculate karo
-        const saved = timeFIFO - timeAI;
-        const percent = (timeFIFO > 0) ? (saved / timeFIFO * 100) : 0;
+        const saved = timeFIFO - timeAI; // compute time saved
+        const percent = (timeFIFO > 0) ? (saved / timeFIFO * 100) : 0; // compute percent saved
         
         if (saved > 0.0001) {
-            log('cmp', `🏆 AI was ${saved.toFixed(4)}s (${percent.toFixed(1)}%) faster!`);
+            log('cmp', `🏆 AI was ${saved.toFixed(4)}s (${percent.toFixed(1)}%) faster!`); // AI faster
         } else {
-            log('cmp', `🐌 AI was ${Math.abs(saved).toFixed(4)}s slower.`);
+            log('cmp', `🐌 AI was ${Math.abs(saved).toFixed(4)}s slower.`); // AI slower or equal
         }
         
-        const blob = await response.blob();
-        const filename = response.headers.get('content-disposition')?.split('filename=')[1]?.replace(/"/g, '') || "encrypted_ai.zip";
+        const blob = await response.blob(); // get package blob
+        const filename = response.headers.get('content-disposition')?.split('filename=')[1]?.replace(/"/g, '') || "encrypted_ai.zip"; // derive filename
         
-        log('cmp', `AI-Priority package created: ${filename}`);
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = filename;
-        link.textContent = `⬇️ Download AI-Priority Package`;
-        link.className = 'download-link';
-        logHTML('cmp', link); // Download link log mein add karo
+        log('cmp', `AI package created: ${filename}`); // log filename
+        const link = document.createElement('a'); // create download link
+        link.href = URL.createObjectURL(blob); // blob URL
+        link.download = filename; // suggested filename
+        link.textContent = `⬇️ Download Package`; // link text
+        link.className = 'download-link'; // styling class
+        logHTML('cmp', link); // append link to compare log
 
-        setStatus("Comparison complete.");
-
+        setStatus("Complete."); // update status
     } catch (e) {
-        log('cmp', `❌ ERROR: ${e.message}`);
-        setStatus(`Error: ${e.message}`);
+        log('cmp', `❌ ERROR: ${e.message}`); // log error
+        setStatus(`Error: ${e.message}`); // update status with error
     } finally {
-        $('btnCompare').disabled = false;
+        $('btnCompare').disabled = false; // re-enable button
     }
 };
 
-/* ========= Decrypt Page Logic ========= */
-// Decrypt button ko enable/disable karo
+/* ========= Decrypt Page ========= */
+// enable/disable decrypt button depending on if a package file and password are present
 const enableDecrypt = () => { $('btnDecrypt').disabled = !($('pkg').files.length && $('pwDec').value.trim()); };
-$('pkg').onchange = enableDecrypt;
-$('pwDec').oninput = enableDecrypt;
+$('pkg').onchange = enableDecrypt; // check when package input changes
+$('pwDec').oninput = enableDecrypt; // check when password input changes
 
-// Decrypt button click - encrypted package ko server ke pass bhejo
 $('btnDecrypt').onclick = async () => {
-    $('btnDecrypt').disabled = true;
-    log('dec', "🚀 Sending package to server for decryption...");
-    setStatus("Decrypting...");
+    $('btnDecrypt').disabled = true; // prevent double clicks
+    log('dec', "🚀 Sending package..."); // log action
+    setStatus("Decrypting..."); // update status
     
-    const file = $('pkg').files[0];
-    const password = $('pwDec').value.trim();
-    
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('password', password);
+    const formData = new FormData(); // create payload
+    formData.append('file', $('pkg').files[0]); // attach selected package
+    formData.append('password', $('pwDec').value.trim()); // attach password
     
     try {
-        const response = await fetch('/api/decrypt', { method: 'POST', body: formData });
-        
+        const response = await fetch('/api/decrypt', { method: 'POST', body: formData }); // send to backend
         if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error || `Server responded with ${response.status}`);
+            const err = await response.json(); // parse error body
+            throw new Error(err.error || `Error ${response.status}`); // throw
         }
-        
-        // Server se JSON response le aao (files list ke saath)
-        const data = await response.json();
-        
-        if (data.files && data.files.length > 0) {
-            log('dec', `✅ Success! Server decrypted ${data.files.length} file(s):`);
-            
-            // Har file ke liye download link banao
+        const data = await response.json(); // parse JSON response
+        if (data.files && data.files.length > 0) { // if server returned file list
+            log('dec', `✅ Decrypted ${data.files.length} files:`); // log count
             data.files.forEach(file => {
-                const link = document.createElement('a');
-                // Filename ko URL mein encode karo (spaces etc. handle karne ke liye)
-                link.href = `/api/download_decrypted/${data.session_id}/${encodeURIComponent(file)}`;
-                // Download attribute browser ko bata deta hai download karo, navigate nahi
-                link.download = file.split('/').pop(); // Sirf filename nikalo
-                link.textContent = `⬇️ Download "${file}"`;
-                link.className = 'download-link';
-                logHTML('dec', link); // Link ko log mein add karo
+                const link = document.createElement('a'); // create download link
+                link.href = `/api/download_decrypted/${data.session_id}/${encodeURIComponent(file)}`; // server endpoint
+                link.download = file.split('/').pop(); // suggested filename
+                link.textContent = `⬇️ Download "${file}"`; // link text
+                link.className = 'download-link'; // styling class
+                logHTML('dec', link); // append to decrypt log
             });
         } else {
-            log('dec', "✅ Decryption complete, but no files were found in the package.");
+            log('dec', "✅ Complete (No files found)."); // no files returned
         }
-        
-        setStatus("Decryption complete.");
-        
+        setStatus("Complete."); // update status
     } catch (e) {
-        log('dec', `❌ ERROR: ${e.message}`);
-        setStatus(`Error: ${e.message}`);
+        log('dec', `❌ ERROR: ${e.message}`); // log error
+        setStatus(`Error: ${e.message}`); // update status
     } finally {
-        $('btnDecrypt').disabled = false;
+        $('btnDecrypt').disabled = false; // re-enable button
     }
 };
 
-/* ========= Initial Load ========= */
-// Page load hone ke baad sab setup karo
+// run initialization on window load
 window.onload = () => {
-    initChart();
-    switchTab('encrypt'); // "Encrypt" tab se shuru karo
-    setStatus("Ready");
-    fetchAutoSettings(); // Auto-detected settings fetch karo
+    initChart(); // initialize the comparison chart
+    switchTab('encrypt'); // default to encrypt tab
+    setStatus("Ready"); // set initial status
 };
