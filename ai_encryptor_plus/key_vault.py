@@ -5,29 +5,6 @@ from cryptography.hazmat.primitives import hashes, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from .config import VAULT_DB, MASTER_ENV
 
-# --- MODIFICATION ---
-# Hum yahan se check HATATE hain.
-# Check ko un functions ke andar move karenge jo key use karte hain.
-#
-# MASTER_SECRET = os.environ.get(MASTER_ENV)
-# if not MASTER_SECRET:
-#     raise RuntimeError(f"Set env {MASTER_ENV} to a strong secret (32+ chars).")
-#
-# --- END MODIFICATION ---
-
-def _get_master_secret():
-    """
-    NAYA helper function jo runtime par secret nikalta hai.
-    Store_key aur load_key se ye call hota hai.
-    """
-    secret = os.environ.get(MASTER_ENV)
-    if not secret:
-        # Ab error tab aata hai jab use hota hai, import time par nahi
-        raise RuntimeError(
-            f"{MASTER_ENV} set nahi hai. Server ne use se pehle set karna tha."
-        )
-    return secret
-
 def _kdf(master: str, salt: bytes) -> bytes:
     # Master secret se encryption key derive karte hain
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000)
@@ -52,7 +29,12 @@ def _ensure_schema(conn: sqlite3.Connection):
     conn.execute("""
     CREATE TABLE IF NOT EXISTS keys(
       id TEXT PRIMARY KEY,
+      
+      -- --- MODIFICATION ---
+      --   Fixed "NOTNULL" to "NOT NULL"
       created_at INTEGER NOT NULL,
+      -- --- END MODIFICATION ---
+
       salt BLOB NOT NULL,
       iv BLOB NOT NULL,
       wrapped_key BLOB NOT NULL,
@@ -65,29 +47,25 @@ def init():
     with sqlite3.connect(VAULT_DB) as c:
         _ensure_schema(c)
 
-def store_key(key_id: str, raw_key: bytes, mode: str) -> None:
+def store_key(key_id: str, raw_key: bytes, mode: str, master_secret: str) -> None:
     # Key ko vault mein store karte hain
     init()
-    # --- MODIFICATION ---
-    # Runtime par secret nikaalte hain, file ke top se nahi
-    master_secret = _get_master_secret()
-    # --- END MODIFICATION ---
+    if not master_secret:
+        raise ValueError("Master secret cannot be empty for storing a key")
     
     import secrets
     salt = secrets.token_bytes(16)
     wrap_k = _kdf(master_secret, salt)
     iv = secrets.token_bytes(16)
     wrapped = _aes_cbc_encrypt(wrap_k, iv, raw_key)
-    with sqlite3.connect(VAULT_DB) as c:
+    with sqlite3.connect(VAULT_DB, timeout=10.0) as c: # Added timeout
         c.execute("REPLACE INTO keys(id,created_at,salt,iv,wrapped_key,mode) VALUES(?,?,?,?,?,?)",
                   (key_id, int(time.time()), salt, iv, wrapped, mode))
         c.commit()
 
-def load_key(key_id: str):
-    # --- MODIFICATION ---
-    # Runtime par secret nikaalte hain, file ke top se nahi
-    master_secret = _get_master_secret()
-    # --- END MODIFICATION ---
+def load_key(key_id: str, master_secret: str):
+    if not master_secret:
+        raise ValueError("Master secret is required to load a key")
 
     # Database se encrypted key nikaalte hain
     with sqlite3.connect(VAULT_DB) as c:
