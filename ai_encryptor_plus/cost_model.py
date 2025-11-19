@@ -29,3 +29,4 @@ class CostModel:
         # Jab real measured time mile to is function ko call karo taaki predictor update ho jaye.
         # actual_s = observed seconds, wo adaptive predictor me bhej rahe hain.
         self.adaptive.observe(chunk_size, suffix, actual_s, sample)
+
