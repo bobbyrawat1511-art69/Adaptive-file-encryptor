@@ -20,7 +20,9 @@ def _aes_gcm(key: bytes, nonce12: bytes, data: bytes) -> bytes:
     a = AESGCM(key)
     return a.encrypt(nonce12, data, None)
 
-def encrypt_stream(path: str, out_path: str, mode: str, key_id: str, key: bytes, chunk_size_bytes: int=1024*1024):
+# --- MODIFICATION ---
+# Added 'master_secret' argument.
+def encrypt_stream(path: str, out_path: str, mode: str, key_id: str, key: bytes, master_secret: str, chunk_size_bytes: int=1024*1024):
     # Temp file mein likho phir atomic replace karo
     out_p = Path(out_path)
     tmp = out_p.with_suffix(out_p.suffix + ".tmp")
@@ -66,7 +68,10 @@ def encrypt_stream(path: str, out_path: str, mode: str, key_id: str, key: bytes,
             json.dump(meta_data, m, indent=2)
     except Exception:
         pass
-    store_key(key_id, key, mode)
+    
+    # --- MODIFICATION ---
+    # Pass 'master_secret' to store_key.
+    store_key(key_id, key, mode, master_secret)
 
 def encrypt_file_whole_cbc(src: Path, dst: Path, key: bytes):
     # Puri file ko CBC mode mein encrypt karo
